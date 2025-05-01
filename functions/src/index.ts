@@ -1,91 +1,76 @@
-import * as admin from "firebase-admin";
-import * as functions from "firebase-functions/v2/https";
-import { Response } from "express";
-import { Database } from "./utilities/database/database";
-import { ClientRepository } from "./utilities/repositories/client_repository";
-import { Repository } from "./utilities/repositories/repository";
-import { WebService } from "./utilities/interfaces/web_service";
-import { ClientValidator } from "./utilities/validators/client_validator";
-import { Validator } from "./utilities/interfaces/valitator";
-import { AuthorizationValidator } from "./utilities/validators/authorization_validator";
-import { ClientService } from "./utilities/web_services/client_service/client_service";
-import { ResponseBuilder } from "./utilities/response_builder/response_builder";
+/**
+ * Import function triggers from their respective submodules:
+ *
+ * import {onCall} from "firebase-functions/v2/https";
+ * import {onDocumentWritten} from "firebase-functions/v2/firestore";
+ *
+ * See a full list of supported triggers at https://firebase.google.com/docs/functions
+ */
 
-admin.initializeApp();
-const database = new Database(admin.firestore());
+import { onRequest } from "firebase-functions/v2/https";
+import { HTTPHandler } from "./utils/http";
+import { logRequest, responseTime, withAuth, registerService } from "./utils/middleware";
+import { adaptMiddleware } from './utils/http/adapters';
+import { requestManager, RequestManager } from './utils/http/request-manager';
+import * as fs from 'fs';
+import * as path from 'path';
 
-// -- Dependencies
-const repositories = new Repository(new ClientRepository(database));
-
-// NOTE: don't use hashmap here to avoid creating unnecessary services.
-let supportedServices: string[] = ["client"];
-
-supportedServices.forEach((name) => {
-  exports[name] = functions.onRequest((req, res) => {
-    runValidators(validatorsFor(name).slice(), req, res).then(() => {
-      const service = webService(name);
-      if (service == undefined) {
-        return ResponseBuilder.serviceUnavailable(res, null, [
-          `service is not registered for :/${name}`,
-        ]);
-      }
-
-      webService(name)?.onRequest(req, res);
-    });
-  });
+// Configure request manager
+requestManager.setHeaders({
+  "Content-Type": "application/json"
 });
 
-function webService(serviceName: string): WebService | undefined {
-  switch (serviceName) {
-    case "client":
-      return new ClientService(repositories.client);
-    default:
-      return undefined;
-  }
+// If you have an API base URL in environment variables
+if (process.env.API_BASE_URL) {
+  const config = {
+    baseURL: process.env.API_BASE_URL,
+    timeout: 5000, // 5 seconds timeout
+    headers: {
+      "Content-Type": "application/json"
+    }
+  };
+  new RequestManager(config);
 }
 
-function runValidators(
-  validators: Validator[],
-  req: functions.Request,
-  res: Response
-): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const validationPromises = validators.map((validator) => {
-      return new Promise<void>((resolve, reject) => {
-        validator.validate(req, res, (error?: any) => {
-          if (error) {
-            reject(error); // Reject the promise if validation fails
-          } else {
-            resolve(); // Resolve the promise if validation succeeds
-          }
-        });
-      });
-    });
+// Dynamically import all path services
+const pathsDir = path.join(__dirname, 'paths');
 
-    validationPromises
-      .reduce(
-        (chain, validationPromise) => chain.then(() => validationPromise),
-        Promise.resolve()
-      )
-      .then(() => {
-        resolve();
-      })
-      .catch((error) => {
-        // Handle the validation error
-        res.json({ error: "Validation failed" });
-        reject(error);
-      });
+// Read all directories in the paths folder
+const pathDirs = fs.readdirSync(pathsDir, { withFileTypes: true })
+  .filter(dirent => dirent.isDirectory())
+  .map(dirent => dirent.name);
+
+// Import each path's services and create handlers
+for (const pathName of pathDirs) {
+  const service = require(`./paths/${pathName}`).default;
+  registerService(service);
+
+  // Create middleware chain
+  const middleware = [
+    logRequest,
+    responseTime,
+    withAuth()  // Use system defaults
+  ];
+
+  const handler = new HTTPHandler({
+    services: service.handlers,
+    middleware: adaptMiddleware(middleware)
   });
-}
-
-function validatorsFor(serviceName: string): Validator[] {
-  switch (serviceName) {
-    case "client":
-      return [];
-    default:
-      return [
-        new ClientValidator(repositories.client),
-        new AuthorizationValidator(),
-      ];
-  }
+  
+  // Create and export the function
+  exports[pathName] = onRequest(async (request, response) => {
+    try {
+      await handler.handle(request, response);
+    } catch (error) {
+      // Only handle unexpected errors that weren't caught by handlers
+      console.error(`Unexpected error in ${pathName}:`, error);
+      if (!response.headersSent) {
+        response.status(500).json({
+          success: false,
+          data: null,
+          errors: [error instanceof Error ? error.message : 'Unknown error']
+        });
+      }
+    }
+  });
 }
